@@ -16,11 +16,11 @@ This work is licensed under a
 
 Cite as:
 
-@Misc{Fu2025PaperStudyOnline,   
-  author = {Yanzhou Fu and Austin R.J. Downey},   
+@Misc{Satme2026PaperResourceAware,   
+  author = {Joud N. Satme and Alexandra I. Giese},   
   howpublished = {GitHub},  
-  title  = {Paper-2025-A-Study-of-Online-Melt-Pool-Plume-and-Spatter-Tracking-in-Laser-Powder-Bed-Fusion-using-DBSCAN},   
-  year   = {2025},  
+  title  = {Paper-Resource-Aware-On-Device-Signal-Compensation},   
+  year   = {2026},  
   groups = {{ARTS-L}ab},    
-  url    = {https://github.com/ARTS-Laboratory/Paper-2025-A-Study-of-Online-Melt-Pool-Plume-and-Spatter-Tracking-in-Laser-Powder-Bed-Fusion},    
+  url    = {https://github.com/ARTS-Laboratory/Paper-Resource-Aware-On-Device-Signal-Compensation},    
 }
