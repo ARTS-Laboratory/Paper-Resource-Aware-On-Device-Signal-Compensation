@@ -1,0 +1,5 @@
+C006 -> 1.0 Gain
+C007 -> 0.8 Gain
+C008 -> 1.5 Gain
+C009 -> 2.0 Gain
+C010 -> 2.5 Gain

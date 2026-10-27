@@ -1,0 +1,674 @@
+%% ============================================================
+%  Run Exported LSTM Model in MATLAB
+%
+%  Loads the exact CSV parameter files used by the Teensy:
+%       WI.CSV, WH.CSV, B.CSV, FCW.CSV, FCB.CSV,
+%       NORM.CSV, META.CSV
+%
+%  The hidden-unit count is read automatically from META.CSV.
+%  The script manually performs the same single-layer LSTM
+%  forward pass used by the embedded implementation.
+%% ============================================================
+
+clc;
+clear;
+close all;
+
+%% ---------------- User Settings ----------------
+
+modelFolder = ['C:\Users\joud\Dropbox\' ...
+    'Satme_2026_IEEE_Edge_Processing_Compensator\Code\' ...
+    'MATLAB\Model 5\Teensy_LSTM_Parameters'];
+
+dataFolder = ['C:\Users\joud\Dropbox\' ...
+    'Satme_2026_IEEE_Edge_Processing_Compensator\Code\MATLAB'];
+
+% Input-data file. Expected columns:
+%   Column 1: time
+%   Column 2: LSTM input signal
+%   Column 3: optional reference signal
+rawFile = fullfile(dataFolder, 'RAW.CSV');
+
+% Set the time unit used in Column 1:
+%   "auto", "seconds", "milliseconds", or "microseconds"
+timeUnit = "auto";
+
+% Plot limits
+fftFrequencyLimit = [0 25];
+
+% Degradation filter settings
+filterOrder = 5;
+highpassCutoff = 10;   % Hz
+
+% Optional fixed axis limits. Leave commented to use automatic limits.
+% timeMagnitudeLimit = [-3 2];
+% fftMagnitudeLimit  = [-100 -30];
+
+% Output folders and files
+outDir = fullfile(dataFolder, 'Paper_Plots');
+
+if ~exist(outDir, 'dir')
+    mkdir(outDir);
+end
+
+saveMatlabOutput = true;
+matlabOutputFile = fullfile(modelFolder, 'MATLAB_COMP.CSV');
+
+%% ---------------- Load Metadata ----------------
+
+meta = readmatrix(fullfile(modelFolder, 'META.CSV'));
+meta = meta(isfinite(meta));
+
+if isempty(meta)
+    error('META.CSV is empty or could not be read.');
+end
+
+hiddenSize = round(meta(1));
+
+if hiddenSize <= 0
+    error('Invalid hidden-unit count in META.CSV: %g', meta(1));
+end
+
+fprintf('Hidden units read from META.CSV: %d\n', hiddenSize);
+
+if numel(meta) >= 2
+    fprintf('Metadata value 2: %.10g\n', meta(2));
+end
+
+if numel(meta) >= 3
+    fprintf('Metadata value 3: %.10g\n', meta(3));
+end
+
+if numel(meta) >= 4
+    fprintf('Metadata value 4: %.10g\n', meta(4));
+end
+
+if numel(meta) >= 5
+    fprintf('Metadata value 5: %.10g\n', meta(5));
+end
+
+%% ---------------- Load Exported Parameters ----------------
+
+Wi  = readmatrix(fullfile(modelFolder, 'WI.CSV'));
+Wh  = readmatrix(fullfile(modelFolder, 'WH.CSV'));
+b   = readmatrix(fullfile(modelFolder, 'B.CSV'));
+Wfc = readmatrix(fullfile(modelFolder, 'FCW.CSV'));
+bfc = readmatrix(fullfile(modelFolder, 'FCB.CSV'));
+normValues = readmatrix(fullfile(modelFolder, 'NORM.CSV'));
+
+Wi = Wi(isfinite(Wi));
+b = b(isfinite(b));
+Wfc = Wfc(isfinite(Wfc));
+bfc = bfc(isfinite(bfc));
+normValues = normValues(isfinite(normValues));
+
+% Preserve the two-dimensional recurrent-weight matrix.
+Wh = Wh(:, any(isfinite(Wh), 1));
+Wh = Wh(any(isfinite(Wh), 2), :);
+
+% Reshape vectors into the orientation required by the equations.
+Wi  = Wi(:);
+b   = b(:);
+Wfc = Wfc(:).';
+
+if isempty(bfc)
+    error('FCB.CSV is empty or could not be read.');
+end
+
+bfc = bfc(1);
+
+%% ---------------- Validate Parameter Dimensions ----------------
+
+expectedGateRows = 4 * hiddenSize;
+
+if numel(Wi) ~= expectedGateRows
+    error(['WI.CSV contains %d values, but a %d-unit LSTM requires ' ...
+           '%d values for one input channel.'], ...
+           numel(Wi), hiddenSize, expectedGateRows);
+end
+
+if ~isequal(size(Wh), [expectedGateRows, hiddenSize])
+    error(['WH.CSV has size %d-by-%d, but the expected size is ' ...
+           '%d-by-%d.'], ...
+           size(Wh,1), size(Wh,2), expectedGateRows, hiddenSize);
+end
+
+if numel(b) ~= expectedGateRows
+    error('B.CSV contains %d values; expected %d.', ...
+          numel(b), expectedGateRows);
+end
+
+if numel(Wfc) ~= hiddenSize
+    error('FCW.CSV contains %d values; expected %d.', ...
+          numel(Wfc), hiddenSize);
+end
+
+if numel(normValues) < 4
+    error(['NORM.CSV must contain at least four values: ' ...
+           'input mean, input standard deviation, target mean, ' ...
+           'and target standard deviation.']);
+end
+
+inputMean  = normValues(1);
+inputStd   = normValues(2);
+targetMean = normValues(3);
+targetStd  = normValues(4);
+
+if inputStd == 0 || targetStd == 0
+    error('A standard-deviation value in NORM.CSV is zero.');
+end
+
+fprintf('All exported model dimensions are valid.\n');
+fprintf('Input normalization:  mean = %.10g, std = %.10g\n', ...
+        inputMean, inputStd);
+fprintf('Target normalization: mean = %.10g, std = %.10g\n', ...
+        targetMean, targetStd);
+
+%% ---------------- Load Input Data ----------------
+
+if ~isfile(rawFile)
+    error('Input file was not found: %s', rawFile);
+end
+
+rawData = readmatrix(rawFile);
+rawData = rawData(:, any(isfinite(rawData), 1));
+rawData = rawData(any(isfinite(rawData), 2), :);
+
+if size(rawData, 2) < 2
+    error('The input file must contain at least time and signal columns.');
+end
+
+timeRaw = rawData(:, 1);
+rawSignal = rawData(:, 2);
+
+% If Column 3 exists, use it as the independent reference.
+% Otherwise, use the unfiltered raw signal as the reference.
+hasIndependentReference = size(rawData, 2) >= 3;
+
+if hasIndependentReference
+    referenceSignal = rawData(:, 3);
+    validRows = isfinite(timeRaw) & ...
+                isfinite(rawSignal) & ...
+                isfinite(referenceSignal);
+else
+    validRows = isfinite(timeRaw) & isfinite(rawSignal);
+end
+
+timeRaw = timeRaw(validRows);
+rawSignal = rawSignal(validRows);
+
+if hasIndependentReference
+    referenceSignal = referenceSignal(validRows);
+else
+    referenceSignal = rawSignal;
+end
+
+if numel(rawSignal) < 2
+    error('The input file does not contain enough valid samples.');
+end
+
+% Remove DC offsets before filtering and comparison.
+rawSignal = rawSignal - mean(rawSignal, 'omitnan');
+referenceSignal = referenceSignal - mean(referenceSignal, 'omitnan');
+
+%% ---------------- Convert Time to Seconds ----------------
+
+timeSeconds = convertTimeToSeconds(timeRaw, timeUnit);
+timeSeconds = timeSeconds - timeSeconds(1);
+
+samplePeriod = mean(diff(timeSeconds), 'omitnan');
+
+if ~isfinite(samplePeriod) || samplePeriod <= 0
+    error('The calculated sampling period is invalid.');
+end
+
+samplingRate = 1 / samplePeriod;
+
+fprintf('Samples loaded: %d\n', numel(rawSignal));
+fprintf('Estimated sampling rate: %.6f samples/s\n', samplingRate);
+
+%% ---------------- Create Degraded Signal ----------------
+
+nyquistFrequency = samplingRate / 2;
+
+if highpassCutoff <= 0 || highpassCutoff >= nyquistFrequency
+    error(['The high-pass cutoff must be greater than zero and below ' ...
+           'the Nyquist frequency of %.6f Hz.'], nyquistFrequency);
+end
+
+% Fifth-order Butterworth high-pass filter.
+[filterNumerator, filterDenominator] = butter( ...
+    filterOrder, ...
+    highpassCutoff / nyquistFrequency, ...
+    'high');
+
+% Apply the filter with zero-phase filtering so that the degradation does
+% not introduce an artificial time delay.
+degradedSignal = filtfilt( ...
+    filterNumerator, ...
+    filterDenominator, ...
+    rawSignal);
+
+% Remove any residual numerical DC offset from the filtered signal.
+degradedSignal = degradedSignal - mean(degradedSignal, 'omitnan');
+
+fprintf(['Degraded signal created using a %dth-order Butterworth ' ...
+         'high-pass filter at %.6f Hz.\n'], ...
+        filterOrder, highpassCutoff);
+
+%% ---------------- Run Manual LSTM Inference ----------------
+
+numberOfSamples = numel(degradedSignal);
+
+hiddenState = zeros(hiddenSize, 1);
+cellState = zeros(hiddenSize, 1);
+compensatedSignal = zeros(numberOfSamples, 1);
+
+% Gate indexing used by the Teensy implementation:
+%   1:H       input gate
+%   H+1:2H    forget gate
+%   2H+1:3H   cell candidate
+%   3H+1:4H   output gate
+idxInput     = 1:hiddenSize;
+idxForget    = hiddenSize + (1:hiddenSize);
+idxCandidate = 2*hiddenSize + (1:hiddenSize);
+idxOutput    = 3*hiddenSize + (1:hiddenSize);
+
+fprintf('Running exported-model inference...\n');
+inferenceTimer = tic;
+
+for sampleIndex = 1:numberOfSamples
+
+    normalizedInput = ...
+        (degradedSignal(sampleIndex) - inputMean) / inputStd;
+
+    gateVector = Wi * normalizedInput + Wh * hiddenState + b;
+
+    inputGate     = logisticSigmoid(gateVector(idxInput));
+    forgetGate    = logisticSigmoid(gateVector(idxForget));
+    cellCandidate = tanh(gateVector(idxCandidate));
+    outputGate    = logisticSigmoid(gateVector(idxOutput));
+
+    cellState = forgetGate .* cellState + ...
+                inputGate .* cellCandidate;
+
+    hiddenState = outputGate .* tanh(cellState);
+
+    normalizedOutput = Wfc * hiddenState + bfc;
+
+    compensatedSignal(sampleIndex) = ...
+        normalizedOutput * targetStd + targetMean;
+end
+
+elapsedTime = toc(inferenceTimer);
+
+fprintf('Inference completed in %.3f seconds.\n', elapsedTime);
+fprintf('Average MATLAB inference time: %.3f microseconds/sample.\n', ...
+        1e6 * elapsedTime / numberOfSamples);
+
+%% ---------------- Save MATLAB Output ----------------
+
+if saveMatlabOutput
+
+    outputTable = table( ...
+        timeRaw, ...
+        referenceSignal, ...
+        degradedSignal, ...
+        compensatedSignal, ...
+        'VariableNames', { ...
+        'Time', ...
+        'Reference', ...
+        'Degraded', ...
+        'Compensated'});
+
+    writetable(outputTable, matlabOutputFile);
+
+    fprintf('MATLAB output saved to: %s\n', matlabOutputFile);
+end
+
+%% ============================================================
+%  Figure: Time and Frequency Domains
+% ============================================================
+
+figureWidth  = 6.5;      % Inches
+figureHeight = 4.5;      % Inches
+
+fig1 = figure( ...
+    'Units', 'inches', ...
+    'Position', [1 1 figureWidth figureHeight], ...
+    'PaperPositionMode', 'auto', ...
+    'Color', 'white');
+
+layout1 = tiledlayout(fig1, 2, 1, ...
+    'TileSpacing', 'compact', ...
+    'Padding', 'compact');
+
+% ---------------- Time-Domain Plot ----------------
+
+ax1 = nexttile(layout1);
+
+p1 = plot(timeSeconds, referenceSignal,'LineWidth', 0.2);
+
+hold on;
+p2 = plot(timeSeconds, degradedSignal,'LineWidth', 0.2);
+p3 = plot(timeSeconds, compensatedSignal,'LineWidth', 0.2);
+
+
+
+lgd1 = legend(ax1, [p1 p2 p3], ...
+    'reference signal', ...
+    'degraded signal', ...
+    'compensated signal', ...
+    'Location', 'northwest');
+
+hold off;
+
+grid on;
+box on;
+
+xlabel('time (s)');
+ylabel('acceleration (g)');
+
+xlim([0 max(timeSeconds)]);
+ylim([-3 2]);
+
+% Uncomment to use a fixed time-domain vertical range.
+% ylim(timeMagnitudeLimit);
+
+set(ax1, ...
+    'FontName', 'Times New Roman', ...
+    'FontSize', 10, ...
+    'LineWidth', 0.6, ...
+    'TickDir', 'out');
+
+set(lgd1, ...
+    'FontName', 'Times New Roman', ...
+    'FontSize', 9, ...
+    'Box', 'on', ...
+    'Color', 'white', ...
+    'EdgeColor', 'black', ...
+    'LineWidth', 0.6, ...
+    'ItemTokenSize', [12 8], ...
+    'AutoUpdate', 'off');
+
+% ---------------- Frequency-Domain Plot ----------------
+
+% Create the frequency vector associated with the single-sided FFT.
+N = numberOfSamples;
+frequency = samplingRate * (0:floor(N/2))' / N;
+
+% Calculate single-sided amplitude spectra.
+degradedSpectrum = singleSidedAmplitude(degradedSignal);
+compSpectrum = singleSidedAmplitude(compensatedSignal);
+
+% Convert amplitude spectra to decibels.
+degradedSpectrumDB = 20*log10(degradedSpectrum + eps);
+compSpectrumDB = 20*log10(compSpectrum + eps);
+
+ax2 = nexttile(layout1);
+
+referenceSpectrum = singleSidedAmplitude(referenceSignal);
+referenceSpectrumDB = 20*log10(referenceSpectrum + eps);
+p4 = plot(frequency, referenceSpectrumDB, 'LineWidth', 2.0);
+
+hold on;
+
+p5 = plot(frequency, degradedSpectrumDB, 'LineWidth', 2.0);
+p6 = plot(frequency, compSpectrumDB, 'LineWidth', 2.0);
+
+lgd2 = legend(ax2, [p4 p5 p6], ...
+    'reference signal', ...
+    'degraded signal', ...
+    'compensated signal', ...
+    'Location', 'northwest');
+
+hold off;
+
+grid on;
+box on;
+
+xlabel('frequency (Hz)');
+ylabel('gain (dB)');
+
+xlim([0 22]);
+ylim([-120 0]);
+
+
+% Uncomment to use a fixed FFT vertical range.
+% ylim(fftMagnitudeLimit);
+
+set(ax2, ...
+    'FontName', 'Times New Roman', ...
+    'FontSize', 10, ...
+    'LineWidth', 0.6, ...
+    'TickDir', 'out');
+
+set(lgd2, ...
+    'FontName', 'Times New Roman', ...
+    'FontSize', 9, ...
+    'Box', 'on', ...
+    'Color', 'white', ...
+    'EdgeColor', 'black', ...
+    'LineWidth', 0.6, ...
+    'ItemTokenSize', [12 8], ...
+    'AutoUpdate', 'off');
+
+% ---------------- Export Figure ----------------
+outDir = ['C:\Users\joud\Dropbox\' ...
+    'Satme_2026_IEEE_Edge_Processing_Compensator\' ...
+    'Making figures\Results time and Frequency'];
+outputFile = fullfile(outDir,sprintf('Fig_LSTM_%dUnit_Time_Frequency.png', hiddenSize));
+
+exportgraphics(fig1, outputFile,'Resolution', 300,'BackgroundColor', 'white');
+
+fprintf('\nFigure exported as:\n%s\n', outputFile);
+fprintf('Figure width: %.1f inches\n', figureWidth);
+fprintf('Figure height: %.1f inches\n', figureHeight);
+fprintf('Export resolution: 300 DPI\n');
+
+
+%% ============================================================
+%  Figure: zoomed Time-Domain Comparison
+% ============================================================
+
+figureWidth  = 6.5;      % Inches
+figureHeight = 2.0;      % Inches
+
+figZoom = figure( ...
+    'Units','inches', ...
+    'Position',[1 1 figureWidth figureHeight], ...
+    'PaperPositionMode','auto', ...
+    'Color','white');
+
+axZoom = axes(figZoom);
+
+plot(timeSeconds, referenceSignal, ...
+    'LineWidth',2);
+
+hold on;
+
+plot(timeSeconds, degradedSignal, ...
+    'LineWidth',2);
+
+plot(timeSeconds, compensatedSignal, ...
+    'LineWidth',2);
+
+hold off;
+
+grid on;
+box on;
+
+xlabel('time (s)');
+ylabel('acceleration (g)');
+
+xlim([0 max(timeSeconds)]);
+
+% ------------------------------------------------------------
+% Zoom Options (uncomment and adjust as desired)
+% ------------------------------------------------------------
+
+ xlim([73.0 73.8]);
+ ylim([-0.5 0.5]);
+
+set(axZoom,...
+    'FontName','Times New Roman',...
+    'FontSize',10,...
+    'LineWidth',0.6,...
+    'TickDir','out');
+
+% ---------------- Export Figure ----------------
+outDir = ['C:\Users\joud\Dropbox\' ...
+    'Satme_2026_IEEE_Edge_Processing_Compensator\' ...
+    'Making figures\Results time and Frequency'];
+
+% Create the directory if it does not already exist
+if ~exist(outDir, 'dir')
+    mkdir(outDir);
+end
+
+outputFile = fullfile( ...
+    outDir, ...
+    'Fig_03_Time_Domain_Three_Signals.png');
+
+exportgraphics(figZoom, ...
+    outputFile, ...
+    'Resolution',300, ...
+    'BackgroundColor','white');
+
+fprintf('\nFigure exported as:\n%s\n', outputFile);
+
+%% ---------------- Optional Error Metrics ----------------
+
+degradedError = degradedSignal - referenceSignal;
+compensatedError = compensatedSignal - referenceSignal;
+
+degradedRMSE = sqrt(mean(degradedError.^2, 'omitnan'));
+compensatedRMSE = sqrt(mean(compensatedError.^2, 'omitnan'));
+
+degradedMAE = mean(abs(degradedError), 'omitnan');
+compensatedMAE = mean(abs(compensatedError), 'omitnan');
+
+fprintf('\nError metrics relative to the reference signal:\n');
+fprintf('Degraded-signal RMSE:  %.10g\n', degradedRMSE);
+fprintf('LSTM-compensated RMSE: %.10g\n', compensatedRMSE);
+fprintf('Degraded-signal MAE:   %.10g\n', degradedMAE);
+fprintf('LSTM-compensated MAE:  %.10g\n', compensatedMAE);
+
+%% ============================================================
+%  Local Functions
+% ============================================================
+
+function y = logisticSigmoid(x)
+    % Numerically stable logistic sigmoid.
+
+    y = zeros(size(x));
+
+    positive = x >= 0;
+    negative = ~positive;
+
+    y(positive) = 1 ./ (1 + exp(-x(positive)));
+
+    expX = exp(x(negative));
+    y(negative) = expX ./ (1 + expX);
+end
+
+function timeSeconds = convertTimeToSeconds(timeRaw, timeUnit)
+
+    timeUnit = lower(string(timeUnit));
+
+    if timeUnit == "seconds"
+        scaleFactor = 1;
+
+    elseif timeUnit == "milliseconds"
+        scaleFactor = 1e-3;
+
+    elseif timeUnit == "microseconds"
+        scaleFactor = 1e-6;
+
+    elseif timeUnit == "auto"
+
+        medianDifference = median(diff(timeRaw), 'omitnan');
+
+        if ~isfinite(medianDifference) || medianDifference <= 0
+            error('The time column does not contain valid increasing values.');
+        end
+
+        % Select the scale that produces the most plausible sampling rate
+        % for this vibration-sensing application.
+        candidateScales = [1, 1e-3, 1e-6];
+        candidateRates = 1 ./ (medianDifference .* candidateScales);
+
+        expectedRate = 400;
+
+        [~, bestIndex] = min( ...
+            abs(log10(candidateRates / expectedRate)));
+
+        scaleFactor = candidateScales(bestIndex);
+
+        unitNames = ["seconds", "milliseconds", "microseconds"];
+
+        fprintf('Automatically interpreted time as %s.\n', ...
+                unitNames(bestIndex));
+
+    else
+        error(['Invalid timeUnit. Use "auto", "seconds", ' ...
+               '"milliseconds", or "microseconds".']);
+    end
+
+    timeSeconds = timeRaw * scaleFactor;
+end
+
+function amplitude = singleSidedAmplitude(signal)
+
+    signal = signal(:);
+    signal = signal - mean(signal, 'omitnan');
+
+    N = numel(signal);
+
+    twoSided = abs(fft(signal) / N);
+    amplitude = twoSided(1:floor(N/2) + 1);
+
+    if rem(N, 2) == 0
+        amplitude(2:end-1) = 2 * amplitude(2:end-1);
+    else
+        amplitude(2:end) = 2 * amplitude(2:end);
+    end
+end
+
+
+%% ============================================================
+%  Figure: Frequency Response Function (FRF)
+% ============================================================
+
+
+
+DegradedFRF= degradedSpectrumDB ./ referenceSpectrumDB;
+CompensatedFRF= compSpectrumDB./ referenceSpectrumDB;
+
+
+figFRF = figure('Units','inches', 'Position',[1 1 6.5 2.0],'PaperPositionMode','auto','Color','white');
+
+colors = get(groot,'defaultAxesColorOrder');
+
+plot(frequency, DegradedFRF, ...
+    'Color', colors(2,:), ...
+    'LineWidth', 1.5);
+
+hold on;
+
+plot(frequency, CompensatedFRF,'Color', colors(3,:),'LineWidth', 1.5);
+
+grid on;
+box on;
+
+xlabel('frequency (Hz)');
+ylabel('magnitude');
+
+xlim([0 20]);
+ylim([0 3]);
+
+legend('degraded signal','compensated signal','Location','northwest');
+
+set(gca,'FontName','Times New Roman','FontSize',10,'LineWidth',0.6,'TickDir','out');
+
+exportgraphics(figFRF, fullfile(outDir, sprintf('FRF.png',hiddenSize)),'Resolution',300,'BackgroundColor','white');

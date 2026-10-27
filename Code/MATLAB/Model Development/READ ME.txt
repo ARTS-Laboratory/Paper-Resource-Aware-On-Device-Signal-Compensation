@@ -1,0 +1,17 @@
+Model 1
+MLP vs LSTM comparison
+
+Model 2 
+50 unit single layer trained Offline
+
+Model 3
+100 unit single layer LSTM Offline
+
+Model 4
+150 unit single layer LSTM Offline
+
+Model 5
+170 unit single layer LSTM Offline
+
+Model 6
+200 unit single layer LSTM Offline

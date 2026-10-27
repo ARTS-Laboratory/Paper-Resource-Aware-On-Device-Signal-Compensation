@@ -1,0 +1,2 @@
+ModelUnits,WindowSize,RawStartSample,WarmupRuns,BenchmarkRuns,ParameterCount,ModelParameterBytes,RuntimeWorkspaceBytes,InputBufferBytes,TotalBenchmarkBytes,ModelLoadTime_us,RawDataLoadTime_us,AverageForwardPass_us,MinimumForwardPass_us,MaximumForwardPass_us,AveragePerSample_us,WindowsPerSecond,InputFirstValue,InputLastValue,InputMean,InputMin,InputMax,LastOutput
+10,400,0,10,1000,491,1964,240,1600,3804,21067,11408,9087.486328,9068,9101,22.718715668,110.041428,0.000000000,0.990185201,0.987308741,0.000000000,0.992036998,-0.645726264

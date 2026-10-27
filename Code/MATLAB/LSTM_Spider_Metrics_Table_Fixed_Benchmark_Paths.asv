@@ -1,0 +1,752 @@
+%% ============================================================
+%  LSTM Multi-Model Performance + Energy Table
+%
+%  FAST evaluation method:
+%    - RMSE and TRAC are calculated from each model's existing
+%      Predictions.csv file. The LSTM is NOT reconstructed or rerun.
+%
+%  Embedded benchmark data:
+%    - Memory footprint and forward-pass latency are imported from
+%      BM#.CSV files produced by the Teensy benchmark.
+%
+%  Power data:
+%    - Current is imported from I*.CSV inside each model's power folder.
+%    - The six 300 ms trigger pulses are detected automatically.
+%    - Stage 5 is the timed-forward-pass stage.
+%    - Average current is calculated AFTER pulse 5 ends and BEFORE
+%      pulse 6 begins.
+%
+%  Energy per inference:
+%
+%      Energy_mJ =
+%          SupplyVoltage_V
+%          * Stage5AverageCurrent_A
+%          * AverageForwardPass_s
+%          * 1000
+%
+%  Final table:
+%    ModelUnits
+%    MemoryFootprint_kB
+%    ForwardPassLatency_ms
+%    RMSE
+%    TRAC
+%    EnergyPerInference_mJ
+%
+% ============================================================
+
+clc;
+clear;
+close all;
+
+%% ---------------- User Settings ----------------
+
+% Model prediction folders
+modelRoot = ['C:\Users\joud\Dropbox\' ...
+    'Satme_2026_IEEE_Edge_Processing_Compensator\Data\' ...
+    'Benchtop Test\dataset_collection'];
+
+% Power-measurement folders
+powerRoot = ['C:\Users\joud\Dropbox\' ...
+    'Satme_2026_IEEE_Edge_Processing_Compensator\Data\' ...
+    'Power measurment'];
+
+% Teensy benchmark-result folders
+benchmarkRoot = ['C:\Users\joud\Dropbox\' ...
+    'Satme_2026_IEEE_Edge_Processing_Compensator\Code\Arduino'];
+
+modelSizes = [1 2 4 6 8 10 15 25 50 100 150 170];
+
+predictionFolderNames = { ...
+    'Unit1_Epoch20_Batch32_Window400'
+    'Unit2_Epoch20_Batch32_Window400'
+    'Unit4_Epoch20_Batch32_Window400'
+    'Unit6_Epoch20_Batch32_Window400'
+    'Unit8_Epoch20_Batch32_Window400'
+    'Unit10_Epoch20_Batch32_Window400'
+    'Unit15_Epoch20_Batch32_Window400'
+    'Unit25_Epoch20_Batch32_Window400'
+    'Unit50_Epoch20_Batch32_Window400'
+    'Unit100_Epoch20_Batch32_Window400'
+    'Unit150_Epoch20_Batch32_Window400'
+    'Unit170_Epoch20_Batch32_Window400'};
+
+powerFolderNames = { ...
+    'LSTM 1 unit'
+    'LSTM 2 unit'
+    'LSTM 4 unit'
+    'LSTM 6 unit'
+    'LSTM 8 unit'
+    'LSTM 10 unit'
+    'LSTM 15 unit'
+    'LSTM 25 unit'
+    'LSTM 50 unit'
+    'LSTM 100 unit'
+    'LSTM 150 unit'
+    'LSTM 170 unit'};
+
+% Supply voltage used during current measurements
+supplyVoltage_V = 7.4;
+
+% Select what "memory footprint" means for the final table.
+%
+% Recommended:
+%   "TotalBenchmarkBytes"
+%       = model parameters + LSTM workspace + 400-sample input buffer
+%
+% Alternative:
+%   "ModelParameterBytes"
+%       = trained model weights/biases only
+memoryField = "TotalBenchmarkBytes";
+
+% Output directory
+outDir = fullfile(modelRoot, 'Model_Performance_Metrics');
+
+if ~exist(outDir,'dir')
+    mkdir(outDir);
+end
+
+%% ---------------- Allocate Results ----------------
+
+nModels = numel(modelSizes);
+
+RMSE = nan(nModels,1);
+TRAC = nan(nModels,1);
+
+MemoryFootprint_bytes = nan(nModels,1);
+ForwardPassLatency_us = nan(nModels,1);
+
+Stage5AverageCurrent_mA = nan(nModels,1);
+Stage5AveragePower_W = nan(nModels,1);
+EnergyPerInference_mJ = nan(nModels,1);
+
+PredictionFile = strings(nModels,1);
+BenchmarkFile = strings(nModels,1);
+CurrentFile = strings(nModels,1);
+
+%% ============================================================
+%  1. RMSE and TRAC from Existing Predictions.csv
+% ============================================================
+
+fprintf('\n============================================================\n');
+fprintf(' MODEL ACCURACY METRICS: RMSE AND TRAC\n');
+fprintf('============================================================\n\n');
+
+for k = 1:nModels
+
+    predictionFile = fullfile( ...
+        modelRoot, ...
+        predictionFolderNames{k}, ...
+        'Predictions.csv');
+
+    if ~isfile(predictionFile)
+        error('Predictions.csv not found:\n%s', predictionFile);
+    end
+
+    PredictionFile(k) = string(predictionFile);
+
+    T = readtable( ...
+        predictionFile, ...
+        'VariableNamingRule','preserve');
+
+    requiredColumns = {'Reference','Prediction'};
+
+    if ~all(ismember(requiredColumns,T.Properties.VariableNames))
+        error(['Predictions.csv must contain Reference and Prediction ' ...
+            'columns:\n%s'], predictionFile);
+    end
+
+    reference = double(T.('Reference'));
+    prediction = double(T.('Prediction'));
+
+    valid = isfinite(reference) & isfinite(prediction);
+
+    reference = reference(valid);
+    prediction = prediction(valid);
+
+    % Match the previous evaluation workflow.
+    reference = reference - mean(reference,'omitnan');
+    prediction = prediction - mean(prediction,'omitnan');
+
+    predictionError = reference - prediction;
+
+    RMSE(k) = sqrt(mean( ...
+        predictionError.^2, ...
+        'omitnan'));
+
+    TRAC(k) = tracMetric( ...
+        reference, ...
+        prediction);
+
+    fprintf('%4d-unit: RMSE = %.9f, TRAC = %.9f\n', ...
+        modelSizes(k), RMSE(k), TRAC(k));
+end
+
+%% ============================================================
+%  2. Memory and Forward-Pass Latency from BM#.CSV
+% ============================================================
+
+fprintf('\n============================================================\n');
+fprintf(' TEENSY MEMORY AND LATENCY METRICS\n');
+fprintf('============================================================\n\n');
+
+for k = 1:nModels
+
+    units = modelSizes(k);
+    benchmarkName = sprintf('BM%d.CSV',units);
+
+    % Benchmark files are stored in:
+    %
+    %   ...\Code\Arduino\LSTM_1Unit\BM1.CSV
+    %   ...\Code\Arduino\LSTM_2Unit\BM2.CSV
+    %   ...
+    %
+    % Build the folder/file name directly from the model size.
+    benchmarkFolder = fullfile( ...
+        benchmarkRoot, ...
+        sprintf('LSTM_%dUnit',units));
+
+    benchmarkFile = fullfile( ...
+        benchmarkFolder, ...
+        benchmarkName);
+
+    if ~isfile(benchmarkFile)
+        error(['Could not find %s.\nExpected at:\n%s'], ...
+            benchmarkName, benchmarkFile);
+    end
+
+    BenchmarkFile(k) = string(benchmarkFile);
+
+    B = readtable( ...
+        benchmarkFile, ...
+        'VariableNamingRule','preserve');
+
+    if height(B) < 1
+        error('Benchmark file is empty:\n%s',benchmarkFile);
+    end
+
+    benchmarkVariables = string(B.Properties.VariableNames);
+
+    if ~ismember(memoryField,benchmarkVariables)
+        error(['Requested memory field "%s" was not found in:\n%s\n' ...
+            'Available variables:\n%s'], ...
+            memoryField, ...
+            benchmarkFile, ...
+            strjoin(benchmarkVariables,", "));
+    end
+
+    if ~ismember("AverageForwardPass_us",benchmarkVariables)
+        error(['AverageForwardPass_us was not found in:\n%s'], ...
+            benchmarkFile);
+    end
+
+    MemoryFootprint_bytes(k) = ...
+        double(B{1,char(memoryField)});
+
+    ForwardPassLatency_us(k) = ...
+        double(B{1,'AverageForwardPass_us'});
+
+    fprintf(['%4d-unit: Memory = %.0f bytes, ' ...
+        'Latency = %.6f us/window\n'], ...
+        units, ...
+        MemoryFootprint_bytes(k), ...
+        ForwardPassLatency_us(k));
+end
+
+%% ============================================================
+%  3. Stage-5 Current Draw and Energy per Inference
+% ============================================================
+
+fprintf('\n============================================================\n');
+fprintf(' STAGE-5 POWER AND ENERGY METRICS\n');
+fprintf('============================================================\n\n');
+
+for k = 1:nModels
+
+    units = modelSizes(k);
+
+    currentFolder = fullfile( ...
+        powerRoot, ...
+        powerFolderNames{k});
+
+    if ~isfolder(currentFolder)
+        error('Power folder not found:\n%s',currentFolder);
+    end
+
+    currentMatches = dir(fullfile( ...
+        currentFolder, ...
+        'I*.CSV'));
+
+    if isempty(currentMatches)
+        error('No I*.CSV current file found in:\n%s',currentFolder);
+    end
+
+    % Use the first I*.CSV file in the model folder.
+    currentFile = fullfile( ...
+        currentMatches(1).folder, ...
+        currentMatches(1).name);
+
+    CurrentFile(k) = string(currentFile);
+
+    C = readtable( ...
+        currentFile, ...
+        'VariableNamingRule','preserve');
+
+    requiredCurrentColumns = { ...
+        'Time_s', ...
+        'Trigger', ...
+        'Current_mA'};
+
+    if ~all(ismember( ...
+            requiredCurrentColumns, ...
+            C.Properties.VariableNames))
+
+        error(['Current file must contain Time_s, Trigger, and Current_mA:\n%s'], ...
+            currentFile);
+    end
+
+    timeCurrent = double(C.('Time_s'));
+    trigger = double(C.('Trigger'));
+    current_mA = double(C.('Current_mA'));
+
+    valid = ...
+        isfinite(timeCurrent) & ...
+        isfinite(trigger) & ...
+        isfinite(current_mA);
+
+    timeCurrent = timeCurrent(valid);
+    trigger = trigger(valid);
+    current_mA = current_mA(valid);
+
+    % -------------------------------------------------------------
+    % Detect the six trigger pulses.
+    % -------------------------------------------------------------
+
+    triggerMin = min(trigger);
+    triggerMax = max(trigger);
+
+    if triggerMax <= triggerMin
+        error('Trigger signal has no detectable HIGH/LOW states:\n%s', ...
+            currentFile);
+    end
+
+    triggerThreshold = ...
+        triggerMin + 0.5*(triggerMax-triggerMin);
+
+    triggerHigh = trigger > triggerThreshold;
+
+    risingEdges = find(diff([false; triggerHigh]) == 1);
+    fallingEdges = find(diff([triggerHigh; false]) == -1);
+
+    if numel(risingEdges) < 6 || numel(fallingEdges) < 6
+        error(['Expected six trigger pulses but detected %d rising and ' ...
+            '%d falling edges in:\n%s'], ...
+            numel(risingEdges), ...
+            numel(fallingEdges), ...
+            currentFile);
+    end
+
+    % Use the first six complete pulses.
+    risingEdges = risingEdges(1:6);
+    fallingEdges = fallingEdges(1:6);
+
+    % -------------------------------------------------------------
+    % Stage 5 = timed forward-pass benchmark.
+    %
+    % Pulse 5 occurs immediately BEFORE Stage 5.
+    % Pulse 6 occurs immediately BEFORE Stage 6.
+    %
+    % Therefore use current data from:
+    %
+    %      end of pulse 5
+    %          through
+    %      beginning of pulse 6
+    %
+    % This excludes both 300 ms marker pulses.
+    % -------------------------------------------------------------
+
+    stage5StartIndex = fallingEdges(5) + 1;
+    stage5EndIndex = risingEdges(6) - 1;
+
+    if stage5EndIndex <= stage5StartIndex
+        error('Invalid Stage-5 interval detected in:\n%s',currentFile);
+    end
+
+    stage5Current = ...
+        current_mA(stage5StartIndex:stage5EndIndex);
+
+    Stage5AverageCurrent_mA(k) = ...
+        mean(stage5Current,'omitnan');
+
+    Stage5AveragePower_W(k) = ...
+        supplyVoltage_V * ...
+        (Stage5AverageCurrent_mA(k)/1000);
+
+    % -------------------------------------------------------------
+    % Energy required for ONE average forward pass.
+    %
+    % latency: us -> seconds
+    % energy:  J -> mJ
+    % -------------------------------------------------------------
+
+    forwardPass_s = ...
+        ForwardPassLatency_us(k) * 1e-6;
+
+    EnergyPerInference_mJ(k) = ...
+        Stage5AveragePower_W(k) * ...
+        forwardPass_s * ...
+        1000;
+
+    fprintf(['%4d-unit: I_stage5 = %.3f mA, ' ...
+        'P_stage5 = %.6f W, ' ...
+        'Energy/inference = %.6f mJ\n'], ...
+        units, ...
+        Stage5AverageCurrent_mA(k), ...
+        Stage5AveragePower_W(k), ...
+        EnergyPerInference_mJ(k));
+end
+
+%% ============================================================
+%  4. Final Spider-Plot Metrics Table
+% ============================================================
+
+ModelUnits = modelSizes(:);
+
+MemoryFootprint_kB = ...
+    MemoryFootprint_bytes / 1024;
+
+ForwardPassLatency_ms = ...
+    ForwardPassLatency_us / 1000;
+
+SpiderMetricsTable = table( ...
+    ModelUnits, ...
+    MemoryFootprint_kB, ...
+    ForwardPassLatency_ms, ...
+    RMSE, ...
+    TRAC, ...
+    EnergyPerInference_mJ, ...
+    'VariableNames', { ...
+        'ModelUnits', ...
+        'MemoryFootprint_kB', ...
+        'ForwardPassLatency_ms', ...
+        'RMSE', ...
+        'TRAC', ...
+        'EnergyPerInference_mJ'});
+
+fprintf('\n\n============================================================\n');
+fprintf(' FINAL MODEL METRICS FOR SPIDER PLOT\n');
+fprintf('============================================================\n\n');
+
+disp(SpiderMetricsTable);
+
+%% ---------------- Optional Diagnostic Table ----------------
+%
+% Kept separately so the final spider table contains only the requested
+% five performance dimensions.
+
+DiagnosticTable = table( ...
+    ModelUnits, ...
+    MemoryFootprint_bytes, ...
+    ForwardPassLatency_us, ...
+    Stage5AverageCurrent_mA, ...
+    Stage5AveragePower_W, ...
+    EnergyPerInference_mJ);
+
+fprintf('\n============================================================\n');
+fprintf(' POWER / BENCHMARK DIAGNOSTICS\n');
+fprintf('============================================================\n\n');
+
+disp(DiagnosticTable);
+
+%% ---------------- Export Tables ----------------
+
+spiderTableFile = fullfile( ...
+    outDir, ...
+    'Spider_Plot_Model_Metrics.csv');
+
+diagnosticTableFile = fullfile( ...
+    outDir, ...
+    'Spider_Plot_Power_Diagnostics.csv');
+
+writetable( ...
+    SpiderMetricsTable, ...
+    spiderTableFile);
+
+writetable( ...
+    DiagnosticTable, ...
+    diagnosticTableFile);
+
+fprintf('\nSpider-plot metrics saved to:\n%s\n', ...
+    spiderTableFile);
+
+fprintf('\nDiagnostic metrics saved to:\n%s\n', ...
+    diagnosticTableFile);
+
+%% ============================================================
+%  Local Function: TRAC
+% ============================================================
+
+function value = tracMetric(reference,response)
+
+    reference = reference(:);
+    response = response(:);
+
+    valid = ...
+        isfinite(reference) & ...
+        isfinite(response);
+
+    reference = reference(valid);
+    response = response(valid);
+
+    denominator = ...
+        (reference' * reference) * ...
+        (response' * response);
+
+    if denominator <= eps
+
+        value = NaN;
+
+    else
+
+        value = ...
+            (reference' * response)^2 / ...
+            denominator;
+    end
+end
+
+
+%% ============================================================
+%  Spider Plot: Model Performance Comparison
+%
+%  Axes:
+%       Memory Footprint
+%       Forward-Pass Latency
+%       RMSE
+%       TRAC
+%       Energy per Inference
+%
+%  All metrics are normalized from 0 to 1.
+%
+%  For metrics where LOWER is better:
+%       Memory
+%       Latency
+%       RMSE
+%       Energy
+%
+%  normalization is inverted so that:
+%
+%       1 = best performance
+%       0 = worst performance
+%
+%  TRAC is naturally higher-is-better.
+% ============================================================
+
+% ---------------- Extract Metrics ----------------
+
+spiderModelSizes = SpiderMetricsTable.ModelUnits;
+
+memoryValues = ...
+    SpiderMetricsTable.MemoryFootprint_kB;
+
+latencyValues = ...
+    SpiderMetricsTable.ForwardPassLatency_ms;
+
+rmseValuesSpider = ...
+    SpiderMetricsTable.RMSE;
+
+tracValuesSpider = ...
+    SpiderMetricsTable.TRAC;
+
+energyValues = ...
+    SpiderMetricsTable.EnergyPerInference_mJ;
+
+% ---------------- Normalize Metrics ----------------
+%
+% normalizeHigherBetter:
+%       smallest value -> 0
+%       largest value  -> 1
+%
+% normalizeLowerBetter:
+%       smallest value -> 1
+%       largest value  -> 0
+
+memoryNorm = ...
+    normalizeLowerBetter(memoryValues);
+
+latencyNorm = ...
+    normalizeLowerBetter(latencyValues);
+
+rmseNorm = ...
+    normalizeLowerBetter(rmseValuesSpider);
+
+tracNorm = ...
+    normalizeHigherBetter(tracValuesSpider);
+
+energyNorm = ...
+    normalizeLowerBetter(energyValues);
+
+% Matrix:
+% rows    = models
+% columns = spider axes
+
+spiderData = [ ...
+    memoryNorm, ...
+    latencyNorm, ...
+    rmseNorm, ...
+    tracNorm, ...
+    energyNorm];
+
+% ---------------- Axis Labels ----------------
+
+axisLabels = { ...
+    'memory footprint', ...
+    'forward-pass latency', ...
+    'RMSE', ...
+    'TRAC', ...
+    'energy / inference'};
+
+numberOfAxes = numel(axisLabels);
+numberOfModelsSpider = numel(spiderModelSizes);
+
+% Angles around circle
+theta = linspace( ...
+    0, ...
+    2*pi, ...
+    numberOfAxes + 1);
+
+% ---------------- Create Figure ----------------
+
+figSpider = figure( ...
+    'Units','inches', ...
+    'Position',[1 1 6.5 5.5], ...
+    'PaperPositionMode','auto', ...
+    'Color','white');
+
+axSpider = polaraxes(figSpider);
+
+hold(axSpider,'on');
+
+% ---------------- Plot Models ----------------
+
+spiderHandles = gobjects( ...
+    numberOfModelsSpider,1);
+
+for modelIndex = 1:numberOfModelsSpider
+
+    currentValues = ...
+        spiderData(modelIndex,:);
+
+    % Close polygon by repeating first value
+    currentValues = [ ...
+        currentValues, ...
+        currentValues(1)];
+
+    spiderHandles(modelIndex) = polarplot( ...
+        axSpider, ...
+        theta, ...
+        currentValues, ...
+        'LineWidth',1.2, ...
+        'Marker','o', ...
+        'MarkerSize',4, ...
+        'DisplayName', ...
+        sprintf('%d-unit LSTM', ...
+        spiderModelSizes(modelIndex)));
+
+end
+
+% ---------------- Polar Axis Formatting ----------------
+
+rlim(axSpider,[0 1]);
+
+rticks(axSpider,[0 0.25 0.50 0.75 1]);
+
+axSpider.ThetaTick = ...
+    rad2deg(theta(1:end-1));
+
+axSpider.ThetaTickLabel = ...
+    axisLabels;
+
+axSpider.ThetaZeroLocation = ...
+    'top';
+
+axSpider.ThetaDir = ...
+    'clockwise';
+
+set(axSpider, ...
+    'FontName','Times New Roman', ...
+    'FontSize',9, ...
+    'LineWidth',0.6);
+
+% ---------------- Legend ----------------
+
+legend( ...
+    spiderHandles, ...
+    'Location','eastoutside', ...
+    'Box','on', ...
+    'FontName','Times New Roman', ...
+    'FontSize',9);
+
+% ---------------- Export ----------------
+
+spiderFigureFile = fullfile( ...
+    outDir, ...
+    'LSTM_Model_Spider_Plot.png');
+
+exportgraphics( ...
+    figSpider, ...
+    spiderFigureFile, ...
+    'Resolution',300, ...
+    'BackgroundColor','white');
+
+fprintf('\nSpider plot saved to:\n%s\n', ...
+    spiderFigureFile);
+
+%% ---------------- Normalization Functions ----------------
+%
+% IMPORTANT:
+% If your script already contains local functions, put these two
+% functions at the very END of the .m file with the other functions.
+
+function normalized = normalizeLowerBetter(values)
+
+    minimumValue = min(values,[],'omitnan');
+    maximumValue = max(values,[],'omitnan');
+
+    rangeValue = ...
+        maximumValue - minimumValue;
+
+    if rangeValue <= eps
+
+        normalized = ones(size(values));
+
+    else
+
+        normalized = ...
+            1 - ...
+            (values - minimumValue) ./ ...
+            rangeValue;
+
+    end
+end
+
+function normalized = normalizeHigherBetter(values)
+
+    minimumValue = min(values,[],'omitnan');
+    maximumValue = max(values,[],'omitnan');
+
+    rangeValue = ...
+        maximumValue - minimumValue;
+
+    if rangeValue <= eps
+
+        normalized = ones(size(values));
+
+    else
+
+        normalized = ...
+            (values - minimumValue) ./ ...
+            rangeValue;
+
+    end
+end
+
+

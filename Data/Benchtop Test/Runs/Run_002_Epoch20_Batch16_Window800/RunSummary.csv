@@ -1,0 +1,2 @@
+Final Loss,Final RMSE,Epochs,Batch Size,Window Size,Hidden Units,Training Files,Test File
+0.015005610883235931,0.12249739468097687,20,16,800,50,7,014.csv

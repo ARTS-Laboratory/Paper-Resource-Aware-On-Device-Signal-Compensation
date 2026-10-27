@@ -1,0 +1,45 @@
+%% Time-Domain Plot of Acceleration Data from Two CSV Files
+% Assumes signals are sampled at 400 Hz
+% Author: [Your Name]
+% Date: [Today's Date]
+
+clear; clc; close all;
+
+%% Parameters
+fs = 400;                  % Sampling frequency [Hz]
+dt = 1/fs;                 % Sampling interval [s]
+
+%% Import CSV data
+% Each file is assumed to have one column of acceleration samples
+file1 = 'input.csv'; % Replace with your actual filename
+file2 = 'output.csv'; % Replace with your actual filename
+
+accel1 = readmatrix(file1); 
+accel2 = readmatrix(file2);
+
+%% Generate time vectors
+N1 = length(accel1);
+N2 = length(accel2);
+
+t1 = (0:N1-1) * dt;
+t2 = (0:N2-1) * dt;
+
+%% Plot time-domain signals
+figure;
+
+subplot(2,1,1);
+plot(t1, accel1, 'b');
+xlabel('Time [s]');
+ylabel('Acceleration [m/s^2]');
+title('Time Domain Signal - File 1');
+grid on;
+
+subplot(2,1,2);
+plot(t2, accel2, 'r');
+xlabel('Time [s]');
+ylabel('Acceleration [m/s^2]');
+title('Time Domain Signal - File 2');
+grid on;
+
+sgtitle('Acceleration Signals Sampled at 400 Hz');
+

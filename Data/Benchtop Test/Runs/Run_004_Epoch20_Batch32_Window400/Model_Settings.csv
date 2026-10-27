@@ -1,0 +1,2 @@
+Window Size,Epochs,Batch Size,Training Files,Hidden Units,Optimizer,Loss,Test File
+400,20,32,"006.csv, 008.csv, 009.csv, 010.csv, 011.csv, 012.csv, 013.csv, C006.csv, C007.csv, C008.csv, C009.csv, C010.csv",50,Adam,MSE,014.csv

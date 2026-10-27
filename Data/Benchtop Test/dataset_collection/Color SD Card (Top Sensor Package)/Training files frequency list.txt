@@ -1,0 +1,7 @@
+006.csv = sweep 1-20.9 Hz
+008.csv = single frequency 1 Hz
+009.csv = single frequency 5 Hz
+010.csv = single frequency 8 Hz
+011.csv = single frequency 10 Hz
+012.csv = single frequency 15 Hz
+013.csv = single frequency 20 Hz
